@@ -1,0 +1,246 @@
+RAID FINDER - Mod de cliente Fabric 1.21.1
+Busca diosesmon-client:raid_crystal en los chunks cargados.
+
+COMPILAR:
+1. Instala JDK 21.
+2. En esta carpeta ejecuta:  gradle build   (o ./gradlew build si agregas el wrapper)
+3. El .jar queda en build/libs/raidfinder-1.0.0.jar (NO uses el -sources).
+4. Ponlo en la carpeta mods junto con Fabric API 0.105.0+1.21.1.
+
+USO:
+- Sale en pantalla el cristal mas cercano con coordenadas, distancia y flecha.
+- Tecla J: lista los 10 mas cercanos en el chat.
+- Tecla K: activa/desactiva el texto en pantalla.
+(Las teclas se cambian en Opciones > Controles.)
+
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+package com.nelvin.raidfinder;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.minecraft.block.Block;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.registry.Registries;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ChunkSection;
+import net.minecraft.world.chunk.ChunkStatus;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+public class RaidFinderClient implements ClientModInitializer {
+    private static final Identifier TARGET = Identifier.of("diosesmon-client", "raid_crystal");
+
+    private static volatile List<BlockPos> found = new ArrayList<>();
+    private static boolean hudEnabled = true;
+    private static int tickCounter = 0;
+
+    private static KeyBinding listKey;
+    private static KeyBinding toggleKey;
+
+    @Override
+    public void onInitializeClient() {
+        listKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.raidfinder.list", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_J, "category.raidfinder"));
+        toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.raidfinder.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, "category.raidfinder"));
+
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (client.world == null || client.player == null) {
+                found = new ArrayList<>();
+                return;
+            }
+
+            // Escanea cada 2 segundos
+            if (++tickCounter >= 40) {
+                tickCounter = 0;
+                scan(client);
+            }
+
+            while (toggleKey.wasPressed()) {
+                hudEnabled = !hudEnabled;
+                client.player.sendMessage(Text.literal("Raid Finder: " + (hudEnabled ? "activado" : "desactivado")), true);
+            }
+
+            while (listKey.wasPressed()) {
+                List<BlockPos> list = found;
+                if (list.isEmpty()) {
+                    client.player.sendMessage(Text.literal("No hay Cristales de Raid en los chunks cargados."), false);
+                } else {
+                    client.player.sendMessage(Text.literal("Cristales de Raid encontrados: " + list.size()), false);
+                    BlockPos p = client.player.getBlockPos();
+                    list.stream()
+                        .sorted(Comparator.comparingDouble(b -> b.getSquaredDistance(p)))
+                        .limit(10)
+                        .forEach(b -> client.player.sendMessage(Text.literal(
+                            " - " + b.getX() + " " + b.getY() + " " + b.getZ()
+                            + "  (" + (int) Math.sqrt(b.getSquaredDistance(p)) + " bloques)"), false));
+                }
+            }
+        });
+
+        HudRenderCallback.EVENT.register((context, tickCounter) -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (!hudEnabled || client.player == null || client.options.hudHidden) return;
+
+            List<BlockPos> list = found;
+            if (list.isEmpty()) return;
+
+            BlockPos p = client.player.getBlockPos();
+            BlockPos nearest = list.stream()
+                    .min(Comparator.comparingDouble(b -> b.getSquaredDistance(p)))
+                    .orElse(null);
+            if (nearest == null) return;
+
+            int dist = (int) Math.sqrt(nearest.getSquaredDistance(p));
+            String text = "Cristal de Raid: " + nearest.getX() + " " + nearest.getY() + " " + nearest.getZ()
+                    + " (" + dist + "m) " + direction(client, nearest);
+            context.drawTextWithShadow(client.textRenderer, text, 6, 6, 0xFF55FF);
+            if (list.size() > 1) {
+                context.drawTextWithShadow(client.textRenderer, "Total en rango: " + list.size(), 6, 18, 0xAAAAAA);
+            }
+        });
+    }
+
+    private static void scan(MinecraftClient client) {
+        Block target = Registries.BLOCK.getOrEmpty(TARGET).orElse(null);
+        if (target == null) {
+            found = new ArrayList<>();
+            return;
+        }
+
+        List<BlockPos> result = new ArrayList<>();
+        ChunkPos center = client.player.getChunkPos();
+        int radius = client.options.getViewDistance().getValue();
+
+        for (int cx = center.x - radius; cx <= center.x + radius; cx++) {
+            for (int cz = center.z - radius; cz <= center.z + radius; cz++) {
+                Chunk chunk = client.world.getChunk(cx, cz, ChunkStatus.FULL, false);
+                if (chunk == null) continue;
+
+                ChunkSection[] sections = chunk.getSectionArray();
+                for (int i = 0; i < sections.length; i++) {
+                    ChunkSection section = sections[i];
+                    if (section == null || section.isEmpty()) continue;
+                    if (!section.hasAny(state -> state.isOf(target))) continue;
+
+                    int baseY = (chunk.getBottomSectionCoord() + i) * 16;
+                    for (int x = 0; x < 16; x++) {
+                        for (int y = 0; y < 16; y++) {
+                            for (int z = 0; z < 16; z++) {
+                                if (section.getBlockState(x, y, z).isOf(target)) {
+                                    result.add(new BlockPos(cx * 16 + x, baseY + y, cz * 16 + z));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found = result;
+    }
+
+    private static String direction(MinecraftClient client, BlockPos target) {
+        double dx = target.getX() + 0.5 - client.player.getX();
+        double dz = target.getZ() + 0.5 - client.player.getZ();
+        double angleToTarget = Math.toDegrees(Math.atan2(-dx, dz));
+        double diff = angleToTarget - client.player.getYaw();
+        diff = ((diff % 360) + 540) % 360 - 180;
+        if (Math.abs(diff) < 22.5) return "↑";
+        if (diff >= 22.5 && diff < 67.5) return "↗";
+        if (diff >= 67.5 && diff < 112.5) return "→";
+        if (diff >= 112.5 && diff < 157.5) return "↘";
+        if (diff <= -22.5 && diff > -67.5) return "↖";
+        if (diff <= -67.5 && diff > -112.5) return "←";
+        if (diff <= -112.5 && diff > -157.5) return "↙";
+        return "↓";
+    }
+}
+
+{
+  "schemaVersion": 1,
+  "id": "raidfinder",
+  "version": "${version}",
+  "name": "Raid Finder",
+  "description": "Localiza el Cristal de Raid (diosesmon-client:raid_crystal) en los chunks cargados.",
+  "authors": ["Nelvin"],
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.nelvin.raidfinder.RaidFinderClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
+
+{
+  "key.raidfinder.list": "Listar Cristales de Raid",
+  "key.raidfinder.toggle": "Activar/desactivar HUD",
+  "category.raidfinder": "Raid Finder"
+}
+
+{
+  "key.raidfinder.list": "Listar Cristales de Raid",
+  "key.raidfinder.toggle": "Activar/desactivar HUD",
+  "category.raidfinder": "Raid Finder"
+}
+
+plugins {
+    id 'fabric-loom' version '1.7-SNAPSHOT'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base { archivesName = project.archives_base_name }
+
+repositories {}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") { expand "version": project.version }
+}
+
+tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+org.gradle.jvmargs=-Xmx2G
+minecraft_version=1.21.1
+yarn_mappings=1.21.1+build.3
+loader_version=0.16.5
+fabric_version=0.105.0+1.21.1
+mod_version=1.0.0
+maven_group=com.nelvin
+archives_base_name=raidfinder
